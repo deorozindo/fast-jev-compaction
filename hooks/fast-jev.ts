@@ -42,6 +42,8 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  /** System One endpoint; unset = the TypeSafe default. Read from JEV_BASE_URL. */
+  baseUrl?: string | undefined;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -87,17 +89,22 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   return config;
 }
 
-/** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+/** A `JevAsker` over the engine's `$.http.fetch`. `model` may list fallbacks in order ("jev-1.13-free,jev-1.13"): the next one is tried when a request fails. */
+export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string, baseUrl?: string): JevAsker {
+  const models = model.split(',').map((m) => m.trim()).filter(Boolean);
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
-      const response = await fetchFn(request.url, {
-        method: request.method,
-        headers: request.headers,
-        body: request.body,
-      });
-      return parseJevResponse(response.status, response.ok, response.text);
+      let last: unknown;
+      for (const m of models) {
+        try {
+          const request = buildJevRequest({ apiKey, model: m, ...(baseUrl ? { baseUrl } : {}) }, state, questions);
+          const response = await fetchFn(request.url, { method: request.method, headers: request.headers, body: request.body });
+          return parseJevResponse(response.status, response.ok, response.text);
+        } catch (error) {
+          last = error;
+        }
+      }
+      throw last ?? new Error('no Jev model configured');
     },
   };
 }
@@ -168,7 +175,7 @@ export async function compactSession(
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model, config.baseUrl), config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -232,15 +239,19 @@ async function getApiKey(
   config: HookConfig,
 ): Promise<string | undefined> {
   if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
+  return envOrSetting($, 'TYPESAFE_API_KEY');
+}
+
+/** A variable from the process environment, or from the `env` block of the settings. */
+async function envOrSetting(
+  $: { env: { get: (name: string) => Promise<string | undefined> }; settings: { read: () => Promise<Readonly<Record<string, unknown>>> } },
+  name: string,
+): Promise<string | undefined> {
+  const fromEnv = await $.env.get(name);
   if (fromEnv) return fromEnv;
-  const settings = await $.settings.read();
-  const env = settings['env'];
-  if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
-    if (typeof value === 'string' && value) return value;
-  }
-  return undefined;
+  const env = (await $.settings.read())['env'];
+  const value = env && typeof env === 'object' ? (env as Record<string, unknown>)[name] : undefined;
+  return typeof value === 'string' && value ? value : undefined;
 }
 
 function notify(
@@ -262,7 +273,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
+      const config = { ...configured, apiKey: await getApiKey($, configured), baseUrl: await envOrSetting($, 'JEV_BASE_URL') };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
