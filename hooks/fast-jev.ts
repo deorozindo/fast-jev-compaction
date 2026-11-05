@@ -239,17 +239,12 @@ async function getApiKey(
   config: HookConfig,
 ): Promise<string | undefined> {
   if (config.apiKey) return config.apiKey;
-  return envOrSetting($, 'TYPESAFE_API_KEY');
+  return (await $.env.get('TYPESAFE_API_KEY')) || settingEnv(await $.settings.read(), 'TYPESAFE_API_KEY');
 }
 
-/** A variable from the process environment, or from the `env` block of the settings. */
-async function envOrSetting(
-  $: { env: { get: (name: string) => Promise<string | undefined> }; settings: { read: () => Promise<Readonly<Record<string, unknown>>> } },
-  name: string,
-): Promise<string | undefined> {
-  const fromEnv = await $.env.get(name);
-  if (fromEnv) return fromEnv;
-  const env = (await $.settings.read())['env'];
+/** A variable from the `env` block of the settings. */
+function settingEnv(settings: Readonly<Record<string, unknown>>, name: string): string | undefined {
+  const env = settings['env'];
   const value = env && typeof env === 'object' ? (env as Record<string, unknown>)[name] : undefined;
   return typeof value === 'string' && value ? value : undefined;
 }
@@ -273,7 +268,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured), baseUrl: await envOrSetting($, 'JEV_BASE_URL') };
+      const config = { ...configured, apiKey: await getApiKey($, configured), baseUrl: (await $.env.get('JEV_BASE_URL')) || settingEnv(await $.settings.read(), 'JEV_BASE_URL') };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
